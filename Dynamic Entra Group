@@ -1,0 +1,230 @@
+# =================================================================================================
+# Create dynamic Microsoft Entra groups based on Microsoft 365 licence service plans
+# Targets:
+#   - Microsoft 365 E5 / ME5: SkuPartNumber SPE_E5
+#   - Microsoft 365 Business Premium / BP: SkuPartNumber SPB
+#
+# What this script does:
+#   1. Installs Microsoft Graph PowerShell if required
+#   2. Connects to Microsoft Graph
+#   3. Harvests subscribed SKUs and service plans
+#   4. Exports SKU and service plan reference data to CSV
+#   5. Builds dynamic membership rules using assignedPlans.servicePlanId
+#   6. Creates or updates dynamic security groups
+# =================================================================================================
+
+$ErrorActionPreference = "Stop"
+
+# -----------------------------
+# 1. Configuration
+# -----------------------------
+$E5SkuPartNumber = "SPE_E5"
+$BPSkuPartNumber = "SPB"
+
+$E5GroupDisplayName = "LIC-M365-E5-Dynamic-Users"
+$BPGroupDisplayName = "LIC-M365-BP-Dynamic-Users"
+
+$E5GroupMailNickname = "lic-m365-e5-dynamic-users"
+$BPGroupMailNickname = "lic-m365-bp-dynamic-users"
+
+# Optional: set these after reviewing the exported CSV or console output.
+# If left blank, the script will pause and prompt you to paste the selected servicePlanId values.
+$E5UniqueServicePlanId = ""
+$BPUniqueServicePlanId = ""
+
+$ExportPath = Join-Path -Path $env:TEMP -ChildPath "M365-Licence-ServicePlans.csv"
+
+# -----------------------------
+# 2. Install Microsoft Graph PowerShell modules
+# -----------------------------
+Write-Host "Checking Microsoft Graph PowerShell module..." -ForegroundColor Cyan
+
+if (-not (Get-Module -ListAvailable -Name Microsoft.Graph)) {
+    Write-Host "Microsoft.Graph module not found. Installing for current user..." -ForegroundColor Yellow
+    Install-Module Microsoft.Graph -Scope CurrentUser -Repository PSGallery -Force
+}
+else {
+    Write-Host "Microsoft.Graph module already installed." -ForegroundColor Green
+}
+
+Import-Module Microsoft.Graph.Authentication
+Import-Module Microsoft.Graph.Identity.DirectoryManagement
+Import-Module Microsoft.Graph.Groups
+Import-Module Microsoft.Graph.Users
+
+# -----------------------------
+# 3. Connect to Microsoft Graph
+# -----------------------------
+$Scopes = @(
+    "Organization.Read.All",
+    "User.Read.All",
+    "Group.ReadWrite.All",
+    "Directory.ReadWrite.All"
+)
+
+Write-Host "Connecting to Microsoft Graph..." -ForegroundColor Cyan
+Connect-MgGraph -Scopes $Scopes
+
+$Context = Get-MgContext
+Write-Host "Connected tenant ID: $($Context.TenantId)" -ForegroundColor Green
+
+# -----------------------------
+# 4. Harvest subscribed SKUs and service plan IDs
+# -----------------------------
+Write-Host "Harvesting subscribed SKUs and service plans..." -ForegroundColor Cyan
+
+$SubscribedSkus = Get-MgSubscribedSku -All
+
+$SkuSummary = $SubscribedSkus | Select-Object SkuPartNumber, SkuId, ConsumedUnits
+Write-Host "Subscribed SKUs found:" -ForegroundColor Cyan
+$SkuSummary | Sort-Object SkuPartNumber | Format-Table -AutoSize
+
+$ServicePlanInventory = foreach ($Sku in $SubscribedSkus) {
+    foreach ($Plan in $Sku.ServicePlans) {
+        [PSCustomObject]@{
+            SkuPartNumber       = $Sku.SkuPartNumber
+            SubscriptionSkuId   = $Sku.SkuId
+            ConsumedUnits       = $Sku.ConsumedUnits
+            ServicePlanName     = $Plan.ServicePlanName
+            ServicePlanId       = $Plan.ServicePlanId
+            ProvisioningStatus  = $Plan.ProvisioningStatus
+            AppliesTo           = $Plan.AppliesTo
+        }
+    }
+}
+
+$ServicePlanInventory | Sort-Object SkuPartNumber, ServicePlanName | Export-Csv -Path $ExportPath -NoTypeInformation -Encoding UTF8
+Write-Host "Service plan inventory exported to: $ExportPath" -ForegroundColor Green
+
+# -----------------------------
+# 5. Identify the target subscription/SKU IDs
+# -----------------------------
+$E5Sku = $SubscribedSkus | Where-Object { $_.SkuPartNumber -eq $E5SkuPartNumber }
+$BPSku = $SubscribedSkus | Where-Object { $_.SkuPartNumber -eq $BPSkuPartNumber }
+
+if (-not $E5Sku) { Write-Warning "Microsoft 365 E5 SKU '$E5SkuPartNumber' was not found in this tenant." }
+if (-not $BPSku) { Write-Warning "Microsoft 365 Business Premium SKU '$BPSkuPartNumber' was not found in this tenant." }
+
+if ($E5Sku) {
+    Write-Host "ME5 / Microsoft 365 E5 subscription ID to record: $($E5Sku.SkuId)" -ForegroundColor Green
+    Write-Host "Available E5 service plans:" -ForegroundColor Cyan
+    $E5Sku.ServicePlans | Sort-Object ServicePlanName | Select-Object ServicePlanName, ServicePlanId, ProvisioningStatus | Format-Table -AutoSize
+}
+
+if ($BPSku) {
+    Write-Host "BP / Microsoft 365 Business Premium subscription ID to record: $($BPSku.SkuId)" -ForegroundColor Green
+    Write-Host "Available Business Premium service plans:" -ForegroundColor Cyan
+    $BPSku.ServicePlans | Sort-Object ServicePlanName | Select-Object ServicePlanName, ServicePlanId, ProvisioningStatus | Format-Table -AutoSize
+}
+
+# -----------------------------
+# 6. Optional helper: compare E5 and BP service plans
+# -----------------------------
+if ($E5Sku -and $BPSku) {
+    $E5PlanIds = $E5Sku.ServicePlans.ServicePlanId.Guid
+    $BPPlanIds = $BPSku.ServicePlans.ServicePlanId.Guid
+
+    $E5OnlyPlans = $E5Sku.ServicePlans | Where-Object { $BPPlanIds -notcontains $_.ServicePlanId.Guid } | Sort-Object ServicePlanName
+    $BPOnlyPlans = $BPSku.ServicePlans | Where-Object { $E5PlanIds -notcontains $_.ServicePlanId.Guid } | Sort-Object ServicePlanName
+
+    Write-Host "Candidate E5-only service plans:" -ForegroundColor Cyan
+    $E5OnlyPlans | Select-Object ServicePlanName, ServicePlanId, ProvisioningStatus | Format-Table -AutoSize
+
+    Write-Host "Candidate BP-only service plans:" -ForegroundColor Cyan
+    $BPOnlyPlans | Select-Object ServicePlanName, ServicePlanId, ProvisioningStatus | Format-Table -AutoSize
+}
+
+# -----------------------------
+# 7. Confirm servicePlanId values for the dynamic rules
+# -----------------------------
+if ([string]::IsNullOrWhiteSpace($E5UniqueServicePlanId) -and $E5Sku) {
+    $E5UniqueServicePlanId = Read-Host "Paste the selected E5 unique servicePlanId to use in the dynamic group rule"
+}
+
+if ([string]::IsNullOrWhiteSpace($BPUniqueServicePlanId) -and $BPSku) {
+    $BPUniqueServicePlanId = Read-Host "Paste the selected Business Premium unique servicePlanId to use in the dynamic group rule"
+}
+
+# -----------------------------
+# 8. Build dynamic membership rules
+# -----------------------------
+$E5MembershipRule = '(user.accountEnabled -eq true) and (user.assignedPlans -any (assignedPlan.servicePlanId -eq "' + $E5UniqueServicePlanId + '" and assignedPlan.capabilityStatus -eq "Enabled"))'
+$BPMembershipRule = '(user.accountEnabled -eq true) and (user.assignedPlans -any (assignedPlan.servicePlanId -eq "' + $BPUniqueServicePlanId + '" and assignedPlan.capabilityStatus -eq "Enabled"))'
+
+Write-Host "E5 dynamic membership rule:" -ForegroundColor Cyan
+Write-Host $E5MembershipRule
+
+Write-Host "Business Premium dynamic membership rule:" -ForegroundColor Cyan
+Write-Host $BPMembershipRule
+
+# -----------------------------
+# 9. Function to create or update dynamic security groups
+# -----------------------------
+function New-OrUpdate-DynamicSecurityGroup {
+    param(
+        [Parameter(Mandatory = $true)] [string] $DisplayName,
+        [Parameter(Mandatory = $true)] [string] $MailNickname,
+        [Parameter(Mandatory = $true)] [string] $Description,
+        [Parameter(Mandatory = $true)] [string] $MembershipRule
+    )
+
+    $ExistingGroup = Get-MgGroup -Filter "displayName eq '$DisplayName'" -ConsistencyLevel eventual -CountVariable GroupCount -Property Id,DisplayName,GroupTypes,MembershipRule,MembershipRuleProcessingState | Select-Object -First 1
+
+    $GroupBody = @{
+        displayName                   = $DisplayName
+        description                   = $Description
+        mailEnabled                   = $false
+        mailNickname                  = $MailNickname
+        securityEnabled               = $true
+        groupTypes                    = @("DynamicMembership")
+        membershipRule                = $MembershipRule
+        membershipRuleProcessingState = "On"
+    }
+
+    if ($ExistingGroup) {
+        Write-Host "Updating existing group: $DisplayName" -ForegroundColor Yellow
+        Update-MgGroup -GroupId $ExistingGroup.Id -BodyParameter @{
+            description                   = $Description
+            membershipRule                = $MembershipRule
+            membershipRuleProcessingState = "On"
+        }
+        return Get-MgGroup -GroupId $ExistingGroup.Id -Property Id,DisplayName,MembershipRule,MembershipRuleProcessingState
+    }
+    else {
+        Write-Host "Creating new dynamic security group: $DisplayName" -ForegroundColor Green
+        return New-MgGroup -BodyParameter $GroupBody
+    }
+}
+
+# -----------------------------
+# 10. Create or update the ME5 and BP groups
+# -----------------------------
+if ($E5Sku -and -not [string]::IsNullOrWhiteSpace($E5UniqueServicePlanId)) {
+    $E5Group = New-OrUpdate-DynamicSecurityGroup ` 
+        -DisplayName $E5GroupDisplayName ` 
+        -MailNickname $E5GroupMailNickname ` 
+        -Description "Dynamic security group for enabled Microsoft 365 E5 users. Rule is based on assignedPlans.servicePlanId." ` 
+        -MembershipRule $E5MembershipRule
+
+    Write-Host "E5 group ready: $($E5Group.DisplayName) / $($E5Group.Id)" -ForegroundColor Green
+}
+
+if ($BPSku -and -not [string]::IsNullOrWhiteSpace($BPUniqueServicePlanId)) {
+    $BPGroup = New-OrUpdate-DynamicSecurityGroup ` 
+        -DisplayName $BPGroupDisplayName ` 
+        -MailNickname $BPGroupMailNickname ` 
+        -Description "Dynamic security group for enabled Microsoft 365 Business Premium users. Rule is based on assignedPlans.servicePlanId." ` 
+        -MembershipRule $BPMembershipRule
+
+    Write-Host "Business Premium group ready: $($BPGroup.DisplayName) / $($BPGroup.Id)" -ForegroundColor Green
+}
+
+# -----------------------------
+# 11. Validate group configuration
+# -----------------------------
+Write-Host "Validation output:" -ForegroundColor Cyan
+Get-MgGroup -Filter "displayName eq '$E5GroupDisplayName'" -ConsistencyLevel eventual -Property Id,DisplayName,MembershipRule,MembershipRuleProcessingState | Select-Object Id,DisplayName,MembershipRule,MembershipRuleProcessingState | Format-List
+Get-MgGroup -Filter "displayName eq '$BPGroupDisplayName'" -ConsistencyLevel eventual -Property Id,DisplayName,MembershipRule,MembershipRuleProcessingState | Select-Object Id,DisplayName,MembershipRule,MembershipRuleProcessingState | Format-List
+
+Write-Host "Completed. Allow time for Microsoft Entra to process dynamic membership." -ForegroundColor Green
+Disconnect-MgGraph
